@@ -1,330 +1,227 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+# Copyright (c) 2021 PaddlePaddle Authors. All Rights Reserved.
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 
-import numpy as np
+#     http://www.apache.org/licenses/LICENSE-2.0
 
-import time
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+train.py
+~~~~~~~~
+
+A script to train the captioner.
+"""
 import os
-from six.moves import cPickle
+import time
+import json
+import pickle
+import random
 import traceback
 
-import opts
-import models
-from dataloader import *
-import skimage.io
-import eval_utils
-import misc.utils as utils
-from misc.rewards import init_scorer, get_self_critical_reward
-from misc.loss_wrapper import LossWrapper
-import os
-# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+from tqdm import tqdm
 
-try:
-    import tensorboardX as tb
-except ImportError:
-    print("tensorboardX is not installed")
-    tb = None
+# paddle
+import paddle
+# options
+from config.config import parse_opt
+# model
+from model.AoAModel import AoAModel
+# dataloader
+from model.dataloader import get_dataloaders
+# criterion
+from model.loss import LossWrapper
+# utils
+from utils import utils, eval_utils
 
-def add_summary_value(writer, key, value, iteration):
-    if writer:
-        writer.add_scalar(key, value, iteration)
-
-def train(opt):
-    # Deal with feature things before anything
-    opt.use_fc, opt.use_att = utils.if_use_feat(opt.caption_model)
-    if opt.use_box: opt.att_feat_size = opt.att_feat_size + 5
-
-    acc_steps = getattr(opt, 'acc_steps', 1)
-    print(opt)
+def main(opt):
+    # set up loader
     opt_1 = opt
     opt_1.input_att_dir = '/home/whc/Desktop/Fitment/code/bottom-up-attention.pytorch-origin/output/feature_total_tcyb_H'
     opt_2 = opt
     opt_2.input_att_dir = '/home/whc/Desktop/Fitment/code/bottom-up-attention.pytorch-origin/output/feature_total_tcyb_RandomRotation'
     opt_3 = opt
     opt_3.input_att_dir = '/home/whc/Desktop/Fitment/code/bottom-up-attention.pytorch-origin/output/feature_total_tcyb_RandomVerticalFlip'
-    
-    loader = DataLoader(opt)
-    loader_1 = DataLoader(opt_1)
-    loader_2 = DataLoader(opt_2)
-    loader_3 = DataLoader(opt_3)
-    opt.vocab_size = loader.vocab_size
-    opt.seq_length = loader.seq_length
+    train_loader, val_loader, _ = get_dataloaders(opt)
+    train_loader_1, _, _ = get_dataloaders(opt_1)
+    train_loader_2, _, _ = get_dataloaders(opt_2)
+    train_loader_3, _, _ = get_dataloaders(opt_3)
+    opt.vocab_size = train_loader.dataset.vocab_size
+    opt.seq_length = train_loader.dataset.seq_length
 
-    tb_summary_writer = tb and tb.SummaryWriter(opt.checkpoint_path)
-
+    # training info and history
     infos = {}
     histories = {}
     if opt.start_from is not None:
         # open old infos and check if models are compatible
-        with open(os.path.join(opt.start_from, 'infos_'+opt.id+'.pkl'), 'rb') as f:
-            infos = utils.pickle_load(f)
-            saved_model_opt = infos['opt']
-            need_be_same=["caption_model", "rnn_type", "rnn_size", "num_layers"]
-            for checkme in need_be_same:
-                assert vars(saved_model_opt)[checkme] == vars(opt)[checkme], "Command line argument and saved model disagree on '%s' " % checkme
+        with open(os.path.join(opt.start_from, 'infos_' + opt.id + '.pkl'), 'rb') as f:
+            infos = pickle.load(f)
 
-        if os.path.isfile(os.path.join(opt.start_from, 'histories_'+opt.id+'.pkl')):
-            with open(os.path.join(opt.start_from, 'histories_'+opt.id+'.pkl'), 'rb') as f:
-                histories = utils.pickle_load(f)
+        if os.path.isfile(os.path.join(opt.start_from, 'histories_' + opt.id + '.pkl')):
+            with open(os.path.join(opt.start_from, 'histories_' + opt.id + '.pkl'), 'rb') as f:
+                histories = pickle.load(f)
     else:
         infos['iter'] = 0
         infos['epoch'] = 0
-        infos['iterators'] = loader.iterators
-        infos['split_ix'] = loader.split_ix
-        infos['vocab'] = loader.get_vocab()
+        infos['vocab'] = train_loader.dataset.get_vocab()
+
     infos['opt'] = opt
 
-    iteration = infos.get('iter', 0)
-    epoch = infos.get('epoch', 0)
-
+    # get training history if opt.start_from else training from scratch
     val_result_history = histories.get('val_result_history', {})
     loss_history = histories.get('loss_history', {})
     lr_history = histories.get('lr_history', {})
     ss_prob_history = histories.get('ss_prob_history', {})
 
-    loader.iterators = infos.get('iterators', loader.iterators)
-    loader.split_ix = infos.get('split_ix', loader.split_ix)
-    if opt.load_best_score == 1:
-        best_val_score = infos.get('best_val_score', None)
+    # restore best_val_score
+    best_val_score = infos.get('best_val_score', None)
 
-    opt.vocab = loader.get_vocab()
-    model = models.setup(opt).cuda()
+    # set up model
+    opt.vocab = train_loader.dataset.get_vocab()
+    model = AoAModel(opt)
     del opt.vocab
-    dp_model = torch.nn.DataParallel(model)
-    lw_model = LossWrapper(model, opt)
-    dp_lw_model = torch.nn.DataParallel(lw_model)
 
-    epoch_done = True
-    # Assure in training mode
-    dp_lw_model.train()
+    # restore model and continue to train
+    if opt.start_from is not None:
+        model.set_state_dict(paddle.load(os.path.join(opt.start_from, 'model.pdparams')))
+        print('Load state dict from %s.' % os.path.join(opt.start_from, 'model.pdparams'))
 
-    if opt.noamopt:
-        assert opt.caption_model in ['transformer','aoa'], 'noamopt can only work with transformer'
-        optimizer = utils.get_std_opt(model, factor=opt.noamopt_factor, warmup=opt.noamopt_warmup)
-        optimizer._step = iteration
-    elif opt.reduce_on_plateau:
-        optimizer = utils.build_optimizer(model.parameters(), opt)
-        optimizer = utils.ReduceLROnPlateau(optimizer, factor=0.5, patience=3)
+    # set up criterion
+    criterion = LossWrapper(model, opt)
+    model.train()
+
+    # set up optimizer
+    if opt.reduce_on_plateau:
+        optimizer = utils.ReduceLROnPlateau(opt.learning_rate, model, opt, factor=0.5, patience=3)
     else:
-        optimizer = utils.build_optimizer(model.parameters(), opt)
-    # Load the optimizer
-    if vars(opt).get('start_from', None) is not None and os.path.isfile(os.path.join(opt.start_from,"optimizer.pth")):
-        optimizer.load_state_dict(torch.load(os.path.join(opt.start_from, 'optimizer.pth')))
-
-
-    def save_checkpoint(model, infos, optimizer, histories=None, append=''):
-        if len(append) > 0:
-            append = '-' + append
-        # if checkpoint_path doesn't exist
-        if not os.path.isdir(opt.checkpoint_path):
-            os.makedirs(opt.checkpoint_path)
-        checkpoint_path = os.path.join(opt.checkpoint_path, 'model%s.pth' %(append))
-        torch.save(model.state_dict(), checkpoint_path)
-        print("model saved to {}".format(checkpoint_path))
-        optimizer_path = os.path.join(opt.checkpoint_path, 'optimizer%s.pth' %(append))
-        torch.save(optimizer.state_dict(), optimizer_path)
-        with open(os.path.join(opt.checkpoint_path, 'infos_'+opt.id+'%s.pkl' %(append)), 'wb') as f:
-            utils.pickle_dump(infos, f)
-        if histories:
-            with open(os.path.join(opt.checkpoint_path, 'histories_'+opt.id+'%s.pkl' %(append)), 'wb') as f:
-                utils.pickle_dump(histories, f)
-
-    # label
-    coco_label = np.load('data/ont_hot_img2label.npy', allow_pickle=True)[()]
+        optimizer = paddle.optimizer.Adam(learning_rate=opt.learning_rate,
+                                          parameters=model.parameters(),
+                                          beta1=opt.optim_alpha, beta2=opt.optim_beta,
+                                          epsilon=opt.optim_epsilon,
+                                          grad_clip=paddle.fluid.clip.ClipGradByValue(opt.grad_clip))
 
     try:
-        while True:
-            if epoch_done:
-                if not opt.noamopt and not opt.reduce_on_plateau:
-                    # Assign the learning rate
-                    if epoch > opt.learning_rate_decay_start and opt.learning_rate_decay_start >= 0:
-                        frac = (epoch - opt.learning_rate_decay_start) // opt.learning_rate_decay_every
-                        decay_factor = opt.learning_rate_decay_rate  ** frac
-                        opt.current_lr = opt.learning_rate * decay_factor
-                    else:
-                        opt.current_lr = opt.learning_rate
-                    utils.set_lr(optimizer, opt.current_lr) # set the decayed rate
-                # Assign the scheduled sampling prob
-                if epoch > opt.scheduled_sampling_start and opt.scheduled_sampling_start >= 0:
-                    if epoch > 25:
-                        model.ss_prob = 1.0
-                    else:
-                        frac = (epoch - opt.scheduled_sampling_start) // opt.scheduled_sampling_increase_every
-                        opt.ss_prob = min(opt.scheduled_sampling_increase_prob  * frac, opt.scheduled_sampling_max_prob)
-                        model.ss_prob = opt.ss_prob
-
-                # If start self critical training
-                if opt.self_critical_after != -1 and epoch >= opt.self_critical_after:
-                    sc_flag = True
-                    init_scorer(opt.cached_tokens)
+        iteration = 0
+        for epoch in range(opt.max_epochs):
+            # update state before each epoch
+            # update learning rate
+            if not opt.reduce_on_plateau:
+                # Assign the learning rate
+                if epoch > opt.learning_rate_decay_start and opt.learning_rate_decay_start >= 0:
+                    frac = (epoch - opt.learning_rate_decay_start) // opt.learning_rate_decay_every
+                    decay_factor = opt.learning_rate_decay_rate ** frac
+                    opt.current_lr = opt.learning_rate * decay_factor
                 else:
-                    sc_flag = False
-
-                epoch_done = False
-            
-            start = time.time()
-            if (opt.use_warmup == 1) and (iteration < opt.noamopt_warmup):
-                opt.current_lr = opt.learning_rate * (iteration+1) / opt.noamopt_warmup
-                utils.set_lr(optimizer, opt.current_lr)
-            # Load data from train split (0)
-            data = loader.get_batch('train')
-            data_1 = loader_1.get_batch('train')
-            data_2 = loader_2.get_batch('train')
-            data_3 = loader_3.get_batch('train')
-            print('Read data:', time.time() - start)
-
-            if (iteration % acc_steps == 0):
-                optimizer.zero_grad()
-            
-            torch.cuda.synchronize()
-            start = time.time()
-            # tmp_label
-            tmp_label = []
-            for tmp_info in data['infos']:
-                try:
-                    tmp_label = tmp_label + list(
-                        np.array(coco_label[tmp_info['id']]).reshape(1, len(coco_label[tmp_info['id']])))
-                except:
-                    tmp_coco_label = [0 for i in range(80)]
-                    tmp_label = tmp_label + list(
-                        np.array(tmp_coco_label).reshape(1, len(tmp_coco_label)))
-                    # print("label miss")
-            # torch.float32
-            class_label = torch.tensor(tmp_label, dtype=torch.float32, device=fc_feats.device)
-            # print(class_label)
-
-            # if epoch > 25:
-            tmp_1 = [data_1['fc_feats'], data_1['att_feats'], data_1['labels'], data_1['masks'], data_1['att_masks']]
-            tmp_1 = [_ if _ is None else _.cuda() for _ in tmp_1]
-            fc_feats_1, att_feats_1, labels_1, masks_1, att_masks_1 = tmp_1
-
-            tmp_2 = [data_2['fc_feats'], data_2['att_feats'], data_2['labels'], data_2['masks'], data_2['att_masks']]
-            tmp_2 = [_ if _ is None else _.cuda() for _ in tmp_2]
-            fc_feats_2, att_feats_2, labels_2, masks_2, att_masks_2 = tmp_2
-
-            tmp_3 = [data_3['fc_feats'], data_3['att_feats'], data_3['labels'], data_3['masks'], data_3['att_masks']]
-            tmp_3 = [_ if _ is None else _.cuda() for _ in tmp_3]
-            fc_feats_3, att_feats_3, labels_3, masks_3, att_masks_3 = tmp_3
-            
-            # else:
-            tmp = [data['fc_feats'], data['att_feats'], data['labels'], data['masks'], data['att_masks']]
-            tmp = [_ if _ is None else _.cuda() for _ in tmp]
-            fc_feats, att_feats, labels, masks, att_masks = tmp
-
-            
-            model_out = dp_lw_model(epoch, fc_feats, fc_feats_1, fc_feats_2, fc_feats_3, att_feats, att_feats_1, att_feats_2, att_feats_3,
-                                    labels, class_label, masks, att_masks, att_masks_1, att_masks_2, att_masks_3, 
-                                    data['gts'], torch.arange(0, len(data['gts'])), sc_flag)
-
-            loss = model_out['loss'].mean()
-            loss_sp = loss / acc_steps
-
-            loss_sp.backward()
-            if ((iteration+1) % acc_steps == 0):
-                utils.clip_gradient(optimizer, opt.grad_clip)
-                optimizer.step()
-            torch.cuda.synchronize()
-            train_loss = loss.item()
-            end = time.time()
-            if not sc_flag:
-                print("iter {} (epoch {}), train_loss = {:.3f}, time/batch = {:.3f}" \
-                    .format(iteration, epoch, train_loss, end - start))
+                    opt.current_lr = opt.learning_rate
+                optimizer.set_lr(opt.current_lr)
             else:
-                print("iter {} (epoch {}), avg_reward = {:.3f}, time/batch = {:.3f}" \
-                    .format(iteration, epoch, model_out['reward'].mean(), end - start))
+                opt.current_lr = optimizer.current_lr
 
-            # Update the iteration and epoch
-            iteration += 1
-            if data['bounds']['wrapped']:
-                epoch += 1
-                epoch_done = True
+            # Assign the scheduled sampling prob
+            if epoch > opt.scheduled_sampling_start and opt.scheduled_sampling_start >= 0:
+                frac = (epoch - opt.scheduled_sampling_start) // opt.scheduled_sampling_increase_every
+                opt.ss_prob = min(opt.scheduled_sampling_increase_prob * frac, opt.scheduled_sampling_max_prob)
+                model.ss_prob = opt.ss_prob
 
-            # Write the training loss summary
-            if (iteration % opt.losses_log_every == 0):
-                add_summary_value(tb_summary_writer, 'train_loss', train_loss, iteration)
-                # add_summary_value(tb_summary_writer, 'img_loss', train_loss, iteration)
-                # add_summary_value(tb_summary_writer, 'cap_loss', train_loss, iteration)
-                if opt.noamopt:
-                    opt.current_lr = optimizer.rate()
-                elif opt.reduce_on_plateau:
-                    opt.current_lr = optimizer.current_lr
-                add_summary_value(tb_summary_writer, 'learning_rate', opt.current_lr, iteration)
-                add_summary_value(tb_summary_writer, 'scheduled_sampling_prob', model.ss_prob, iteration)
-                if sc_flag:
-                    add_summary_value(tb_summary_writer, 'avg_reward', model_out['reward'].mean(), iteration)
+            # If start self critical training
+            if opt.self_critical_after != -1 and epoch >= opt.self_critical_after:
+                sc_flag = True
+                utils.init_scorer(opt.cached_tokens)
+            else:
+                sc_flag = False
 
-                loss_history[iteration] = train_loss if not sc_flag else model_out['reward'].mean()
-                lr_history[iteration] = opt.current_lr
-                ss_prob_history[iteration] = model.ss_prob
+            start = time.time()
+            for fc_feats, att_feats, att_masks, labels, masks, gts, _, _, att_feats_1, att_masks_1, _, _, _, _, att_feats_2, att_masks_2,  _, _, _, _, att_feats_3, att_masks_3, _, _, _  in zip(train_loader, train_loader_1, train_loader_2, train_loader_3):
+                model_out = criterion(fc_feats, att_feats, att_feats_1, att_feats_2, att_feats_3, labels, masks, 
+                                      att_masks, att_masks_1, att_masks_2, att_masks_3, gts,
+                                      paddle.arange(0, len(gts)), sc_flag)
+                loss = model_out['loss']
 
-            # update infos
-            infos['iter'] = iteration
-            infos['epoch'] = epoch
-            infos['iterators'] = loader.iterators
-            infos['split_ix'] = loader.split_ix
-            
-            # make evaluation on validation set, and save model
-            if (iteration % opt.save_checkpoint_every == 0):
-                # eval model
-                eval_kwargs = {'split': 'val',
-                                'dataset': opt.input_json}
-                eval_kwargs.update(vars(opt))
-                val_loss, predictions, lang_stats = eval_utils.eval_split(
-                    dp_model, lw_model.crit, loader, eval_kwargs)
+                # clear the gard
+                optimizer.clear_grad()
+                # backward
+                loss.backward()
+                # step
+                optimizer.step()
 
-                if opt.reduce_on_plateau:
-                    if 'CIDEr' in lang_stats:
-                        optimizer.scheduler_step(-lang_stats['CIDEr'])
+                # Write the training loss summary
+                if iteration % opt.losses_log_every == 0:
+                    if not sc_flag:
+                        print("iter {} (epoch {}), train_loss = {:.3f}, time/batch = {:.3f}" \
+                              .format(iteration, epoch, loss.item(), time.time() - start))
                     else:
-                        optimizer.scheduler_step(val_loss)
-                # Write validation result into summary
-                add_summary_value(tb_summary_writer, 'validation loss', val_loss, iteration)
-                if lang_stats is not None:
-                    for k,v in lang_stats.items():
-                        add_summary_value(tb_summary_writer, k, v, iteration)
-                val_result_history[iteration] = {'loss': val_loss, 'lang_stats': lang_stats, 'predictions': predictions}
+                        print("iter {} (epoch {}), avg_reward = {:.3f}, time/batch = {:.3f}" \
+                              .format(iteration, epoch, model_out['reward'].mean().item(), time.time() - start))
 
-                # Save model if is improving on validation result
-                if opt.language_eval == 1:
-                    current_score = lang_stats['CIDEr']
-                else:
-                    current_score = - val_loss
+                    loss_history[iteration] = loss.item() if not sc_flag else model_out['reward'].mean().item()
+                    lr_history[iteration] = opt.current_lr
+                    ss_prob_history[iteration] = model.ss_prob
 
-                best_flag = False
+                # make evaluation on validation set, and save model
+                if ((iteration+1) % opt.save_checkpoint_every == 0):
+                    # eval model
+                    eval_kwargs = {'split': 'val',
+                                   'dataset': opt.input_json}
+                    eval_kwargs.update(vars(opt))
+                    val_loss, predictions, lang_stats = eval_utils.eval_split(
+                        model, criterion.crit, val_loader, eval_kwargs)
 
-                if best_val_score is None or current_score > best_val_score:
-                    best_val_score = current_score
-                    best_flag = True
+                    if opt.reduce_on_plateau:
+                        if 'CIDEr' in lang_stats:
+                            optimizer.scheduler_step(-lang_stats['CIDEr'])
+                        else:
+                            optimizer.scheduler_step(val_loss)
 
-                # Dump miscalleous informations
-                infos['best_val_score'] = best_val_score
-                histories['val_result_history'] = val_result_history
-                histories['loss_history'] = loss_history
-                histories['lr_history'] = lr_history
-                histories['ss_prob_history'] = ss_prob_history
+                    val_result_history[iteration] = {'loss': val_loss, 'lang_stats': lang_stats,
+                                                     'predictions': predictions}
 
-                save_checkpoint(model, infos, optimizer, histories)
-                if opt.save_history_ckpt:
-                    save_checkpoint(model, infos, optimizer, append=str(iteration))
+                    # Save model if is improving on validation result
+                    if opt.language_eval == 1:
+                        current_score = lang_stats['CIDEr']
+                    else:
+                        current_score = - val_loss
 
-                if best_flag:
-                    save_checkpoint(model, infos, optimizer, append='best')
+                    best_flag = False
 
-            # Stop if reaching max epochs
-            if epoch >= opt.max_epochs and opt.max_epochs != -1:
-                break
+                    if best_val_score is None or current_score > best_val_score:
+                        best_val_score = current_score
+                        best_flag = True
+
+                    # Dump miscalleous informations
+                    infos['best_val_score'] = best_val_score
+                    histories['val_result_history'] = val_result_history
+                    histories['loss_history'] = loss_history
+                    histories['lr_history'] = lr_history
+                    histories['ss_prob_history'] = ss_prob_history
+
+                    utils.save_checkpoint(model, infos, optimizer, opt, histories)
+                    if opt.save_history_ckpt:
+                        utils.save_checkpoint(model, infos, optimizer, opt, append=str(iteration))
+
+                    if best_flag:
+                        utils.save_checkpoint(model, infos, optimizer, opt, append='best')
+
+                # Update the iteration and start time
+                iteration += 1
+                start = time.time()
+
+                # update infos
+                infos['iter'] = iteration
+                infos['epoch'] = epoch
+
     except (RuntimeError, KeyboardInterrupt):
         print('Save ckpt on exception ...')
-        save_checkpoint(model, infos, optimizer)
+        utils.save_checkpoint(model, infos, optimizer, opt)
         print('Save ckpt done.')
         stack_trace = traceback.format_exc()
         print(stack_trace)
 
-
-opt = opts.parse_opt()
-train(opt)
+if __name__ == '__main__':
+    opt = parse_opt()
+    main(opt)

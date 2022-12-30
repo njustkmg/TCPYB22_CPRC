@@ -6,10 +6,9 @@ This repository includes the implementation for Exploiting Cross-Modal Predictio
 
 - Python 3.6
 - Java 1.8.0
-- PyTorch 1.0
+- PaddlePaddle 2.1.0
 - cider (already been added as a submodule)
 - coco-caption (already been added as a submodule)
-- tensorboardX
 
 
 ## Training CPRC
@@ -25,6 +24,7 @@ You should also preprocess the dataset and get the cache for calculating cider s
 ```bash
 $ python scripts/prepro_ngrams.py --input_json data/dataset_coco.json --dict_json data/cocotalk.json --output_pkl data/coco-train --split train
 ```
+
 ### Start training
 
 ```bash
@@ -54,6 +54,3 @@ If you find this repo helpful, please consider citing:
 }
 ```
 
-## Acknowledgements
-
-This repository is based on [self-critical.pytorch](https://github.com/ruotianluo/self-critical.pytorch), and you may refer to it for more details about the code.
