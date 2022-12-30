@@ -1,91 +1,88 @@
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
+# Copyright (c) 2021 PaddlePaddle Authors. All Rights Reserved.
 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+
+#     http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""
+train.py
+~~~~~~~~
+
+A script to eval the captioner.
+"""
 import json
-import numpy as np
-
-import time
 import os
-from six.moves import cPickle
-
-import opts
-import models
-from dataloader import *
-from dataloaderraw import *
-import eval_utils
 import argparse
-import misc.utils as utils
-import torch
+import pickle
 
-import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+# paddle
+import paddle
 
-# Input arguments and options
-parser = argparse.ArgumentParser()
-# Input paths
-parser.add_argument('--model', type=str, default='',
-                help='path to model to evaluate')
-parser.add_argument('--cnn_model', type=str,  default='resnet101',
-                help='resnet101, resnet152')
-parser.add_argument('--infos_path', type=str, default='',
-                help='path to infos to evaluate')
-opts.add_eval_options(parser)
+# config
+from config.config import add_eval_options
+# model
+from model.AoAModel import AoAModel
+# dataloader
+from model.dataloader import get_dataloaders
+# eval utils
+from utils.eval_utils import eval_split
 
-opt = parser.parse_args()
+def main(opt):
+    # load infos
+    with open(opt.infos_path, 'rb') as f:
+        infos = pickle.load(f)
 
-# Load infos
-with open(opt.infos_path, 'rb') as f:
-    infos = utils.pickle_load(f)
-
-# override and collect parameters
-replace = ['input_fc_dir', 'input_att_dir', 'input_box_dir', 'input_label_h5', 'input_json', 'batch_size', 'id']
-ignore = ['start_from']
-
-for k in vars(infos['opt']).keys():
-    if k in replace:
-        setattr(opt, k, getattr(opt, k) or getattr(infos['opt'], k, ''))
-    elif k not in ignore:
+    # collect parameter
+    for k in vars(infos['opt']).keys():
         if not k in vars(opt):
-            vars(opt).update({k: vars(infos['opt'])[k]}) # copy over options from model
+            vars(opt).update({k: vars(infos['opt'])[k]})  # copy options from model
 
-vocab = infos['vocab'] # ix -> word mapping
+    # set up dataloader
+    _, _, test_loader = get_dataloaders(opt)
+    # when eval using provided pretrained mode, the vocab may be different from what you have in cocotalk.json
+    # so make sure to use the vocab in infos file
+    test_loader.ix_to_word = infos['vocab']
 
-# Setup the model
-opt.vocab = vocab
-model = models.setup(opt)
-del opt.vocab
-model.load_state_dict(torch.load(opt.model))
-model.cuda()
-model.eval()
-crit = utils.LanguageModelCriterion()
+    # set up model
+    vocab = infos['vocab']
+    opt.vocab = vocab
+    opt.vocab_size = test_loader.dataset.vocab_size
+    model = AoAModel(opt)
+    del opt.vocab
 
-# whc set
-opt.input_json = '/home/whc/Desktop/TCYB/AoANet-pytorch/data/100/cocotalk.json'
-opt.input_label_h5 = '/home/whc/Desktop/TCYB/AoANet-pytorch/data/100/cocotalk_label.h5'
+    # load state_dict
+    model.set_state_dict(paddle.load(opt.model))
+    # set mode
+    model.eval()
 
-# Create the Data Loader instance
-if len(opt.image_folder) == 0:
-  loader = DataLoader(opt)
-else:
-  loader = DataLoaderRaw({'folder_path': opt.image_folder, 
-                            'coco_json': opt.coco_json,
-                            'batch_size': opt.batch_size,
-                            'cnn_model': opt.cnn_model})
-# When eval using provided pretrained model, the vocab may be different from what you have in your cocotalk.json
-# So make sure to use the vocab in infos file.
-loader.ix_to_word = infos['vocab']
+    # set crit to None
+    # since we do not care about loss when evaluate the model
+    crit = None
 
+    _, _, lang_stats = eval_split(model, crit, test_loader, vars(opt))
 
-# Set sample options
-opt.datset = opt.input_json
-loss, split_predictions, lang_stats = eval_utils.eval_split(model, crit, loader, 
-    vars(opt))
+    if lang_stats:
+        # output results
+        print(lang_stats)
 
-print('loss: ', loss)
-if lang_stats:
-  print(lang_stats)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, default='./log/log_aoa_rl/model-best.pdparams',
+                        help='path to model to evaluate.')
+    parser.add_argument('--infos_path', type=str, default='./log/log_aoa_rl/infos_aoa-best.pkl',
+                        help='path to infos to evaluate.')
 
-if opt.dump_json == 1:
-    # dump the json
-    json.dump(split_predictions, open('vis/vis.json', 'w'))
+    add_eval_options(parser)
+
+    opt = parser.parse_args()
+
+    # call main
+    main(opt)
